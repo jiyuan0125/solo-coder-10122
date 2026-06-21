@@ -390,17 +390,48 @@ impl MemoryBackend for FileStore {
         for change in params.content_changes {
             // If range is ommitted, text is the new text of the document
             if let Some(range) = change.range {
-                // Record old positions
-                let (old_end_position, old_end_byte) = {
-                    let last_line_index = file.rope.len_lines() - 1;
-                    (
+                // Record old positions - taken from this change's range.end, NOT the entire document
+                let old_end_byte = file
+                    .rope
+                    .try_line_to_char(range.end.line as usize)
+                    .and_then(|end_char| {
+                        file.rope
+                            .try_char_to_byte(end_char + range.end.character as usize)
+                    })
+                    .map_err(anyhow::Error::msg);
+                let old_end_position = {
+                    let line_idx = range.end.line as usize;
+                    if line_idx < file.rope.len_lines() {
+                        file.rope
+                            .get_line(line_idx)
+                            .context("getting old end line for edit")
+                            .map(|line| {
+                                // UTF-16 code unit count for the column
+                                let col = range.end.character as usize;
+                                let line_str = line.to_string();
+                                let mut utf16_col = 0usize;
+                                let mut byte_col = 0usize;
+                                for (i, c) in line_str.char_indices() {
+                                    if utf16_col >= col {
+                                        byte_col = i;
+                                        break;
+                                    }
+                                    utf16_col += c.len_utf16();
+                                    byte_col = i + c.len_utf8();
+                                }
+                                Point::new(line_idx, byte_col)
+                            })
+                    } else {
+                        let last_line_index = file.rope.len_lines() - 1;
                         file.rope
                             .get_line(last_line_index)
-                            .context("getting last line for edit")
-                            .map(|last_line| Point::new(last_line_index, last_line.len_chars())),
-                        file.rope.bytes().count(),
-                    )
+                            .context("getting last line for old end position")
+                            .map(|last_line| {
+                                Point::new(last_line_index, last_line.len_chars())
+                            })
+                    }
                 };
+
                 // Update the document
                 let start_index = file.rope.line_to_char(range.start.line as usize)
                     + range.start.character as usize;
@@ -408,17 +439,34 @@ impl MemoryBackend for FileStore {
                     file.rope.line_to_char(range.end.line as usize) + range.end.character as usize;
                 file.rope.remove(start_index..end_index);
                 file.rope.insert(start_index, &change.text);
-                // Set new end positions
-                let (new_end_position, new_end_byte) = {
-                    let last_line_index = file.rope.len_lines() - 1;
-                    (
-                        file.rope
-                            .get_line(last_line_index)
-                            .context("getting last line for edit")
-                            .map(|last_line| Point::new(last_line_index, last_line.len_chars())),
-                        file.rope.bytes().count(),
-                    )
+
+                // Set new end positions - recalculate from the inserted text
+                let start_char = file.rope.line_to_char(range.start.line as usize)
+                    + range.start.character as usize;
+                let new_end_char = start_char + change.text.chars().count();
+                let new_end_line_raw = file.rope.char_to_line(new_end_char);
+                let new_end_col_raw =
+                    new_end_char - file.rope.line_to_char(new_end_line_raw);
+                // Convert new_end_col from char count to UTF-16 code unit count per LSP spec
+                let new_end_line = file.rope.get_line(new_end_line_raw);
+                let new_end_col_utf16 = match new_end_line {
+                    Some(line) => {
+                        let s = line.to_string();
+                        let mut utf16_count = 0usize;
+                        for (i, c) in s.char_indices() {
+                            if i >= new_end_col_raw {
+                                break;
+                            }
+                            utf16_count += c.len_utf16();
+                        }
+                        utf16_count
+                    }
+                    None => new_end_col_raw,
                 };
+                let (new_end_position, new_end_byte) = (
+                    Ok(Point::new(new_end_line_raw, new_end_col_utf16)),
+                    file.rope.try_char_to_byte(new_end_char).map_err(anyhow::Error::msg),
+                );
                 // Update the tree
                 if self.params.build_tree {
                     let mut old_tree = file.tree.take();
@@ -430,17 +478,59 @@ impl MemoryBackend for FileStore {
                                 .try_char_to_byte(start_char + range.start.character as usize)
                         })
                         .map_err(anyhow::Error::msg);
+                    let start_position = {
+                        let line_idx = range.start.line as usize;
+                        if line_idx < file.rope.len_lines() {
+                            file.rope
+                                .get_line(line_idx)
+                                .context("getting start line for edit")
+                                .map(|line| {
+                                    let col = range.start.character as usize;
+                                    let line_str = line.to_string();
+                                    let mut utf16_col = 0usize;
+                                    let mut byte_col = 0usize;
+                                    for (i, c) in line_str.char_indices() {
+                                        if utf16_col >= col {
+                                            byte_col = i;
+                                            break;
+                                        }
+                                        utf16_col += c.len_utf16();
+                                        byte_col = i + c.len_utf8();
+                                    }
+                                    Point::new(line_idx, byte_col)
+                                })
+                        } else {
+                            let last_line_index = file.rope.len_lines() - 1;
+                            file.rope
+                                .get_line(last_line_index)
+                                .context("getting last line for start position")
+                                .map(|last_line| {
+                                    Point::new(last_line_index, last_line.len_chars())
+                                })
+                        }
+                    };
                     if let Some(old_tree) = &mut old_tree {
-                        match (start_byte, old_end_position, new_end_position) {
-                            (Ok(start_byte), Ok(old_end_position), Ok(new_end_position)) => {
+                        match (
+                            start_byte,
+                            start_position,
+                            old_end_position,
+                            old_end_byte,
+                            new_end_position,
+                            new_end_byte,
+                        ) {
+                            (
+                                Ok(start_byte),
+                                Ok(start_position),
+                                Ok(old_end_position),
+                                Ok(old_end_byte),
+                                Ok(new_end_position),
+                                Ok(new_end_byte),
+                            ) => {
                                 old_tree.edit(&InputEdit {
                                     start_byte,
                                     old_end_byte,
                                     new_end_byte,
-                                    start_position: Point::new(
-                                        range.start.line as usize,
-                                        range.start.character as usize,
-                                    ),
+                                    start_position,
                                     old_end_position,
                                     new_end_position,
                                 });
@@ -456,7 +546,12 @@ impl MemoryBackend for FileStore {
                                     }
                                 };
                             }
-                            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                            (Err(e), _, _, _, _, _)
+                            | (_, Err(e), _, _, _, _)
+                            | (_, _, Err(e), _, _, _)
+                            | (_, _, _, Err(e), _, _)
+                            | (_, _, _, _, Err(e), _)
+                            | (_, _, _, _, _, Err(e)) => {
                                 error!("failed to build tree edit: {e:?}");
                             }
                         }

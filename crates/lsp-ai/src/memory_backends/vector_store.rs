@@ -79,16 +79,15 @@ impl StoredChunkUpsert {
 
 fn quantize(embedding: &[f32]) -> Vec<u8> {
     assert!(embedding.len() % 8 == 0);
-    let bytes: Vec<u8> = embedding.iter().map(|x| x.clamp(0., 1.) as u8).collect();
     let mut quantised = Vec::with_capacity(embedding.len() / 8);
-    for i in (0..bytes.len()).step_by(8) {
+    for i in (0..embedding.len()).step_by(8) {
         let mut byte = 0u8;
         for j in 0..8 {
-            byte |= bytes[i + j] << j;
+            let bit = if embedding[i + j] > 0.0 { 1u8 } else { 0u8 };
+            byte |= bit << j;
         }
         quantised.push(byte);
     }
-
     quantised
 }
 
@@ -273,11 +272,10 @@ impl VectorStoreInner {
                 let sub_result_score = if rerank_top_k.is_some() {
                     match &sub_result_chunk.vec {
                         StoredChunkVec::Binary(b) => {
-                            // Convert binary vector to f32 vec
-                            let mut b_f32 = vec![];
+                            let mut b_f32 = Vec::with_capacity(embedding.len());
                             for byte in b {
-                                for i in 0..8 {
-                                    let x = byte >> (8 - i) & 1;
+                                for j in 0..8 {
+                                    let x = (byte >> j) & 1;
                                     b_f32.push(x as f32);
                                 }
                             }
@@ -756,9 +754,14 @@ mod tests {
 
     #[test]
     fn can_quantize() {
-        let v = vec![0.0, 0.5, 1.0, 0.3, 0.8, 0.2, 0.9, 0.1];
-        let quantized = quantize(&v);
-        assert_eq!(quantized, vec![4]);
+        let all_positive = vec![0.1, 0.5, 1.0, 0.3, 0.8, 0.2, 0.9, 0.1];
+        assert_eq!(quantize(&all_positive), vec![0b11111111]);
+
+        let all_negative = vec![-0.1, -0.5, -1.0, -0.3, -0.8, -0.2, -0.9, 0.0];
+        assert_eq!(quantize(&all_negative), vec![0b00000000]);
+
+        let mixed = vec![1.0, -1.0, 2.0, 0.0, 3.0, -0.5, 0.5, -0.1];
+        assert_eq!(quantize(&mixed), vec![0b01010101]);
     }
 
     fn generate_base_vector_store() -> anyhow::Result<VectorStore> {

@@ -464,41 +464,76 @@ async fn do_chat_code_action_resolve(
     // NOTE: We are making some asumptions about the parameters the endpoint takes
     // Some APIs like Gemini do not take the messages in this format. We should add
     // some kind of configuration option for this
-    let mut new_messages = vec![];
-    let mut current_message = String::new();
-    let mut is_user = true;
-    for line in messages_text.lines() {
-        if is_user && line.contains("<|assistant|>") {
-            new_messages.push(serde_json::json!({
-                "role": "user",
-                "content": current_message
-            }));
-            current_message = String::new();
-            is_user = false;
-        } else if !is_user && line.contains("<|user|>") {
-            new_messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": current_message
-            }));
-            current_message = String::new();
-            is_user = true;
+    fn split_lines_preserving_crlf(s: &str) -> Vec<&str> {
+        let mut lines = Vec::new();
+        let mut start = 0;
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\n' {
+                lines.push(&s[start..i]);
+                start = i + 1;
+            } else if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                lines.push(&s[start..i]);
+                start = i + 2;
+                i += 1;
+            }
+            i += 1;
+        }
+        if start < s.len() {
+            lines.push(&s[start..]);
+        }
+        lines
+    }
+
+    let lines = split_lines_preserving_crlf(messages_text);
+    let mut new_messages: Vec<(bool, String)> = Vec::new();
+    let mut current_is_user = true;
+    let mut current_content = String::new();
+    let mut first_line = true;
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let is_assistant = trimmed == "<|assistant|>";
+        let is_user = trimmed == "<|user|>";
+
+        if is_assistant || is_user {
+            if first_line {
+                new_messages.push((current_is_user, String::new()));
+            } else {
+                new_messages.push((current_is_user, std::mem::take(&mut current_content)));
+            }
+            current_is_user = is_user;
         } else {
-            current_message += line;
+            if !current_content.is_empty() {
+                current_content.push('\n');
+            }
+            current_content.push_str(line);
+        }
+        first_line = false;
+
+        if idx == lines.len() - 1 {
+            if is_assistant || is_user {
+                new_messages.push((current_is_user, String::new()));
+            } else {
+                new_messages.push((current_is_user, std::mem::take(&mut current_content)));
+            }
         }
     }
-    if current_message.len() > 0 {
-        if is_user {
-            new_messages.push(serde_json::json!({
-                "role": "user",
-                "content": current_message
-            }));
-        } else {
-            new_messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": current_message
-            }));
-        }
+
+    if lines.is_empty() {
+        new_messages.push((true, String::new()));
     }
+
+    let new_messages_json: Vec<serde_json::Value> = new_messages
+        .into_iter()
+        .map(|(is_user, content)| {
+            serde_json::json!({
+                "role": if is_user { "user" } else { "assistant" },
+                "content": content
+            })
+        })
+        .collect();
 
     // Add the messages to the params messages
     // NOTE: Once again we are making some assumptions that the messages key is even the right key to use here
@@ -507,11 +542,11 @@ async fn do_chat_code_action_resolve(
         messages
             .as_array_mut()
             .context("`messages` key must be an array")?
-            .append(&mut new_messages);
+            .extend(new_messages_json);
     } else {
         params.insert(
             "messages".to_string(),
-            serde_json::to_value(&new_messages).unwrap(),
+            serde_json::to_value(&new_messages_json).unwrap(),
         );
     }
 
@@ -603,31 +638,77 @@ async fn do_code_action_action_resolve(
         )))?;
         let file_text = rx.await?;
 
+        fn split_lines_with_endings(s: &str) -> Vec<&str> {
+            let mut lines = Vec::new();
+            let mut start = 0;
+            let bytes = s.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\n' {
+                    lines.push(&s[start..i]);
+                    start = i + 1;
+                } else if bytes[i] == b'\r' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                        lines.push(&s[start..i]);
+                        start = i + 2;
+                        i += 1;
+                    } else {
+                        lines.push(&s[start..i]);
+                        start = i + 1;
+                    }
+                }
+                i += 1;
+            }
+            if start < s.len() {
+                lines.push(&s[start..]);
+            }
+            lines
+        }
+
+        fn utf16_offset_to_char_idx(line: &str, utf16_offset: usize) -> usize {
+            let mut utf16_count = 0usize;
+            let mut char_idx = 0usize;
+            for (i, c) in line.char_indices() {
+                if utf16_count >= utf16_offset {
+                    return i;
+                }
+                utf16_count += c.len_utf16();
+                char_idx = i + c.len_utf8();
+            }
+            if utf16_count >= utf16_offset {
+                char_idx
+            } else {
+                line.len()
+            }
+        }
+
         // Get the text
-        let lines: Vec<&str> = file_text.lines().collect();
+        let lines = split_lines_with_endings(&file_text);
         let mut result = String::new();
+        let end_line = data.range.end.line as usize;
+        let start_line = data.range.start.line as usize;
         for (i, line) in lines
             .iter()
             .enumerate()
-            .skip(data.range.start.line as usize)
-            .take((data.range.end.line - data.range.start.line + 1) as usize)
+            .skip(start_line)
+            .take((end_line - start_line + 1).max(0))
         {
-            let start_char = if i == data.range.start.line as usize {
-                data.range.start.character as usize
+            let start_byte = if i == start_line {
+                utf16_offset_to_char_idx(line, data.range.start.character as usize)
             } else {
                 0
             };
-            let end_char = if i == data.range.end.line as usize {
-                data.range.end.character as usize + 1
+            let end_byte = if i == end_line {
+                utf16_offset_to_char_idx(line, data.range.end.character as usize)
             } else {
                 line.len()
             };
 
-            if start_char < line.len() {
-                result.push_str(&line[start_char..end_char.min(line.len())]);
-            }
+            let start_clamped = start_byte.min(line.len());
+            let end_clamped = end_byte.max(start_clamped).min(line.len());
+            result.push_str(&line[start_clamped..end_clamped]);
 
-            if i != data.range.end.line as usize {
+            if i != end_line {
                 result.push('\n');
             }
         }
