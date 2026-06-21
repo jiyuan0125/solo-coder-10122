@@ -1,0 +1,67 @@
+{
+  "name": "lsp-ai",
+  "version": "0.1.0",
+  "displayName": "LSP-AI",
+  "publisher": "SilasMarvin",
+  "description": "The official VS Code plugin for LSP-AI. LSP-AI is an open-source language server that serves as a backend for AI-powered functionality, designed to assist and empower software engineers, not replace them.",
+  "icon": "logo-white-black-background-1024x1024.png",
+  "repository": "https://github.com/SilasMarvin/lsp-ai",
+  "main": "/dist/index.js",
+  "scripts": {
+    "vscode:prepublish": "npm run esbuild-base -- --minify",
+    "esbuild-base": "esbuild ./src/index.ts --bundle --outfile=dist/index.js --external:vscode --format=cjs --platform=node",
+    "esbuild": "npm run esbuild-base -- --sourcemap",
+    "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
+    "test-compile": "tsc -p ./"
+  },
+  "author": "",
+  "license": "MIT",
+  "activationEvents": [
+    "onLanguage"
+  ],
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "lsp-ai.generation",
+        "title": "LSP-AI Generation"
+      }
+    ],
+    "configuration": {
+      "title": "LSP-AI",
+      "properties": {
+        "lsp-ai.serverConfiguration": {
+          "type": "object",
+          "default": {},
+          "description": "JSON configuration for LSP-AI language server"
+        },
+        "lsp-ai.generationConfiguration": {
+          "type": "object",
+          "default": {},
+          "description": "JSON configuration for LSP-AI generation"
+        },
+        "lsp-ai.inlineCompletionConfiguration": {
+          "type": "object",
+          "default": {
+            "maxCompletionsPerSecond": 1
+          },
+          "description": "JSON configuration for LSP-AI generation"
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.8",
+    "@vscode/vsce": "^2.26.1",
+    "esbuild": "^0.21.4",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@types/vscode": "^1.85.0",
+    "uuid": "^9.0.1",
+    "vscode-languageclient": "^9.0.1"
+  }
+}
