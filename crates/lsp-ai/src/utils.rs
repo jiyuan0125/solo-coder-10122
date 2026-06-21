@@ -121,3 +121,31 @@ pub(crate) fn merge_json(a: &mut Value, b: &Value) {
         }
     }
 }
+
+pub(crate) fn utf16_offset_to_char_index(s: &str, utf16_offset: usize) -> usize {
+    let mut char_count = 0;
+    let mut utf16_count = 0;
+    for c in s.chars() {
+        if utf16_count >= utf16_offset {
+            break;
+        }
+        utf16_count += c.len_utf16();
+        char_count += 1;
+    }
+    char_count
+}
+
+pub(crate) fn char_index_to_utf16_offset(s: &str, char_index: usize) -> usize {
+    let mut utf16_count = 0;
+    for (i, c) in s.chars().enumerate() {
+        if i >= char_index {
+            break;
+        }
+        utf16_count += c.len_utf16();
+    }
+    utf16_count
+}
+
+pub(crate) fn str_utf16_len(s: &str) -> usize {
+    s.chars().map(|c| c.len_utf16()).sum()
+}

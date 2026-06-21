@@ -23,7 +23,7 @@ use crate::custom_requests::generation_stream::GenerationStreamParams;
 use crate::memory_backends::Prompt;
 use crate::memory_worker::{self, FileRequest, FilterRequest, PromptRequest};
 use crate::transformer_backends::TransformerBackend;
-use crate::utils::{ToResponseError, TOKIO_RUNTIME};
+use crate::utils::{str_utf16_len, ToResponseError, TOKIO_RUNTIME, utf16_offset_to_char_index};
 
 static RE: Lazy<Mutex<HashMap<String, Regex>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -227,6 +227,31 @@ fn post_process_response(
             }
         }
     }
+}
+
+fn parse_chat_messages(text: &str) -> Vec<serde_json::Value> {
+    let mut messages = vec![];
+    let mut current_content = String::new();
+    let mut is_user = true;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+        if trimmed == "<|user|>" || trimmed == "<|assistant|>" {
+            messages.push(serde_json::json!({
+                "role": if is_user { "user" } else { "assistant" },
+                "content": current_content,
+            }));
+            current_content = String::new();
+            is_user = trimmed == "<|user|>";
+        } else {
+            current_content.push_str(line);
+        }
+    }
+    messages.push(serde_json::json!({
+        "role": if is_user { "user" } else { "assistant" },
+        "content": current_content,
+    }));
+    messages
 }
 
 pub(crate) fn run(
@@ -438,10 +463,11 @@ async fn do_chat_code_action_resolve(
     let file_text = rx.await?;
 
     let (messages_text, text_edit_line, text_edit_char) = if action.trigger == "" {
+        let last_line = file_text.lines().last().unwrap_or("");
         (
             file_text.as_str(),
             file_text.lines().count(),
-            file_text.lines().last().unwrap_or("").chars().count(),
+            str_utf16_len(last_line),
         )
     } else {
         let mut split = file_text.splitn(2, &action.trigger);
@@ -453,10 +479,11 @@ async fn do_chat_code_action_resolve(
         let messages_text = split
             .next()
             .context("trigger not found when resolving chat code action")?;
+        let last_line = messages_text.lines().last().unwrap_or("");
         (
             messages_text,
             text_edit_line + messages_text.lines().count(),
-            messages_text.lines().last().unwrap_or("").chars().count(),
+            str_utf16_len(last_line),
         )
     };
 
@@ -464,41 +491,7 @@ async fn do_chat_code_action_resolve(
     // NOTE: We are making some asumptions about the parameters the endpoint takes
     // Some APIs like Gemini do not take the messages in this format. We should add
     // some kind of configuration option for this
-    let mut new_messages = vec![];
-    let mut current_message = String::new();
-    let mut is_user = true;
-    for line in messages_text.lines() {
-        if is_user && line.contains("<|assistant|>") {
-            new_messages.push(serde_json::json!({
-                "role": "user",
-                "content": current_message
-            }));
-            current_message = String::new();
-            is_user = false;
-        } else if !is_user && line.contains("<|user|>") {
-            new_messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": current_message
-            }));
-            current_message = String::new();
-            is_user = true;
-        } else {
-            current_message += line;
-        }
-    }
-    if current_message.len() > 0 {
-        if is_user {
-            new_messages.push(serde_json::json!({
-                "role": "user",
-                "content": current_message
-            }));
-        } else {
-            new_messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": current_message
-            }));
-        }
-    }
+    let mut new_messages = parse_chat_messages(messages_text);
 
     // Add the messages to the params messages
     // NOTE: Once again we are making some assumptions that the messages key is even the right key to use here
@@ -613,18 +606,20 @@ async fn do_code_action_action_resolve(
             .take((data.range.end.line - data.range.start.line + 1) as usize)
         {
             let start_char = if i == data.range.start.line as usize {
-                data.range.start.character as usize
+                utf16_offset_to_char_index(line, data.range.start.character as usize)
             } else {
                 0
             };
             let end_char = if i == data.range.end.line as usize {
-                data.range.end.character as usize + 1
+                utf16_offset_to_char_index(line, data.range.end.character as usize)
             } else {
-                line.len()
+                line.chars().count()
             };
 
-            if start_char < line.len() {
-                result.push_str(&line[start_char..end_char.min(line.len())]);
+            let line_chars: Vec<char> = line.chars().collect();
+            let end = end_char.min(line_chars.len());
+            if start_char < line_chars.len() {
+                result.extend(line_chars[start_char..end].iter());
             }
 
             if i != data.range.end.line as usize {
@@ -883,6 +878,109 @@ mod tests {
     };
     use serde_json::json;
     use std::{sync::mpsc, thread};
+
+    #[test]
+    fn test_parse_chat_messages_basic() {
+        let text = "hello\n<|assistant|>\nworld\n<|user|>\nfoo";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello\n");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "world\n");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "foo");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_preserves_newlines() {
+        let text = "line1\nline2\n<|assistant|>\nline3\nline4\n";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "line1\nline2\n");
+        assert_eq!(messages[1]["content"], "line3\nline4\n");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_starts_with_marker() {
+        let text = "<|assistant|>\nhello";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "hello");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_ends_with_marker() {
+        let text = "hello\n<|assistant|>";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello\n");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_consecutive_markers() {
+        let text = "<|assistant|>\n<|user|>\nhello";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "hello");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_three_markers() {
+        let text = "<|user|>\n<|assistant|>\n<|user|>\nhello";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "hello");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_substring_not_matched() {
+        let text = "hello <|assistant|> world\n<|user|>\nfoo";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello <|assistant|> world\n");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "foo");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_crlf() {
+        let text = "hello\r\n<|assistant|>\r\nworld";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello\r\n");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "world");
+    }
+
+    #[test]
+    fn test_parse_chat_messages_empty() {
+        let text = "";
+        let messages = parse_chat_messages(text);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "");
+    }
 
     #[tokio::test]
     async fn test_do_completion() -> anyhow::Result<()> {

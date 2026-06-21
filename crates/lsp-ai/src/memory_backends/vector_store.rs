@@ -79,17 +79,27 @@ impl StoredChunkUpsert {
 
 fn quantize(embedding: &[f32]) -> Vec<u8> {
     assert!(embedding.len() % 8 == 0);
-    let bytes: Vec<u8> = embedding.iter().map(|x| x.clamp(0., 1.) as u8).collect();
     let mut quantised = Vec::with_capacity(embedding.len() / 8);
-    for i in (0..bytes.len()).step_by(8) {
+    for i in (0..embedding.len()).step_by(8) {
         let mut byte = 0u8;
         for j in 0..8 {
-            byte |= bytes[i + j] << j;
+            let bit = if embedding[i + j] > 0.0 { 1u8 } else { 0u8 };
+            byte |= bit << j;
         }
         quantised.push(byte);
     }
-
     quantised
+}
+
+fn dequantize(binary: &[u8], dimensions: usize) -> Vec<f32> {
+    let mut result = Vec::with_capacity(dimensions);
+    let full_bytes = dimensions.min(binary.len() * 8);
+    for i in 0..full_bytes {
+        let byte = binary[i / 8];
+        let bit = (byte >> (i % 8)) & 1;
+        result.push(bit as f32);
+    }
+    result
 }
 
 enum StoredChunkVec {
@@ -273,26 +283,19 @@ impl VectorStoreInner {
                 let sub_result_score = if rerank_top_k.is_some() {
                     match &sub_result_chunk.vec {
                         StoredChunkVec::Binary(b) => {
-                            // Convert binary vector to f32 vec
-                            let mut b_f32 = vec![];
-                            for byte in b {
-                                for i in 0..8 {
-                                    let x = byte >> (8 - i) & 1;
-                                    b_f32.push(x as f32);
-                                }
-                            }
-                            b_f32.truncate(embedding.len());
+                            let b_f32 = dequantize(b, embedding.len());
+                            let effective_embedding = &embedding[..b_f32.len()];
                             #[cfg(feature = "simsimd")]
                             {
                                 OrderedFloat(
-                                    SpatialSimilarity::dot(&b_f32, &embedding)
+                                    SpatialSimilarity::dot(&b_f32, effective_embedding)
                                         .context("mismatch in vector length when taking the dot product when re-ranking")?
                                         as f32,
                                 )
                             }
                             #[cfg(not(feature = "simsimd"))]
                             {
-                                OrderedFloat(dot_product(&b_f32, &embedding) as f32)
+                                OrderedFloat(dot_product(&b_f32, effective_embedding) as f32)
                             }
                         }
                         StoredChunkVec::F32(_) => {
@@ -758,7 +761,47 @@ mod tests {
     fn can_quantize() {
         let v = vec![0.0, 0.5, 1.0, 0.3, 0.8, 0.2, 0.9, 0.1];
         let quantized = quantize(&v);
-        assert_eq!(quantized, vec![4]);
+        assert_eq!(quantized, vec![254]);
+    }
+
+    #[test]
+    fn can_quantize_all_positive() {
+        let v = vec![0.1; 8];
+        let quantized = quantize(&v);
+        assert_eq!(quantized, vec![255]);
+    }
+
+    #[test]
+    fn can_quantize_all_negative() {
+        let v = vec![-0.1; 8];
+        let quantized = quantize(&v);
+        assert_eq!(quantized, vec![0]);
+    }
+
+    #[test]
+    fn can_quantize_all_zero() {
+        let v = vec![0.0; 8];
+        let quantized = quantize(&v);
+        assert_eq!(quantized, vec![0]);
+    }
+
+    #[test]
+    fn quantize_dequantize_roundtrip() {
+        let v = vec![-1.0, 2.0, -3.0, 4.0, -5.0, 6.0, -7.0, 8.0];
+        let quantized = quantize(&v);
+        let dequantized = dequantize(&quantized, 8);
+        let expected: Vec<f32> = vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        assert_eq!(dequantized, expected);
+    }
+
+    #[test]
+    fn dequantize_truncates_to_dimensions() {
+        let v = vec![1.0; 16];
+        let quantized = quantize(&v);
+        assert_eq!(quantized.len(), 2);
+        let dequantized = dequantize(&quantized, 5);
+        assert_eq!(dequantized.len(), 5);
+        assert_eq!(dequantized, vec![1.0; 5]);
     }
 
     fn generate_base_vector_store() -> anyhow::Result<VectorStore> {

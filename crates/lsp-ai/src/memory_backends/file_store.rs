@@ -11,7 +11,10 @@ use tree_sitter::{InputEdit, Point, Tree};
 use crate::{
     config::{self, Config},
     crawl::Crawl,
-    utils::{parse_tree, tokens_to_estimated_characters},
+    utils::{
+        char_index_to_utf16_offset, parse_tree, tokens_to_estimated_characters,
+        utf16_offset_to_char_index,
+    },
 };
 
 use super::{ContextAndCodePrompt, FIMPrompt, MemoryBackend, MemoryRunParams, Prompt, PromptType};
@@ -45,6 +48,16 @@ impl File {
     pub(crate) fn tree(&self) -> Option<&Tree> {
         self.tree.as_ref()
     }
+}
+
+fn lsp_position_to_char(rope: &Rope, line: usize, character_utf16: usize) -> usize {
+    let line_char_start = rope.line_to_char(line);
+    let line_str = rope
+        .get_line(line)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let char_offset = utf16_offset_to_char_index(&line_str, character_utf16);
+    line_char_start + char_offset
 }
 
 pub(crate) struct FileStore {
@@ -166,8 +179,11 @@ impl FileStore {
             .context("Error file not found")?
             .rope
             .clone();
-        let mut cursor_index = rope.line_to_char(position.position.line as usize)
-            + position.position.character as usize;
+        let mut cursor_index = lsp_position_to_char(
+            &rope,
+            position.position.line as usize,
+            position.position.character as usize,
+        );
         // Add to our rope if we need to
         for file in self
             .accessed_files
@@ -205,8 +221,11 @@ impl FileStore {
             .context("Error file not found")?
             .rope
             .clone();
-        let cursor_index = rope.line_to_char(position.position.line as usize)
-            + position.position.character as usize;
+        let cursor_index = lsp_position_to_char(
+            &rope,
+            position.position.line as usize,
+            position.position.character as usize,
+        );
         let start = cursor_index.saturating_sub(characters / 2);
         let end = rope
             .len_chars()
@@ -292,12 +311,12 @@ impl FileStore {
         let file = file_map
             .get(&uri)
             .with_context(|| format!("trying to get file that does not exist {uri}"))?;
-        let line_char_index = file
-            .rope
-            .try_line_to_char(position.position.line as usize)?;
-        Ok(file
-            .rope
-            .try_char_to_byte(line_char_index + position.position.character as usize)?)
+        let char_index = lsp_position_to_char(
+            &file.rope,
+            position.position.line as usize,
+            position.position.character as usize,
+        );
+        Ok(file.rope.try_char_to_byte(char_index)?)
     }
 }
 
@@ -314,11 +333,14 @@ impl MemoryBackend for FileStore {
             .clone();
         let line = rope
             .get_line(position.position.line as usize)
-            .context("Error getting filter text")?
-            .get_slice(0..position.position.character as usize)
+            .context("Error getting filter text")?;
+        let line_str = line.to_string();
+        let char_count = utf16_offset_to_char_index(&line_str, position.position.character as usize);
+        let result = line
+            .get_slice(0..char_count)
             .context("Error getting filter text")?
             .to_string();
-        Ok(line)
+        Ok(result)
     }
 
     #[instrument(skip(self))]
@@ -390,76 +412,69 @@ impl MemoryBackend for FileStore {
         for change in params.content_changes {
             // If range is ommitted, text is the new text of the document
             if let Some(range) = change.range {
-                // Record old positions
-                let (old_end_position, old_end_byte) = {
-                    let last_line_index = file.rope.len_lines() - 1;
-                    (
-                        file.rope
-                            .get_line(last_line_index)
-                            .context("getting last line for edit")
-                            .map(|last_line| Point::new(last_line_index, last_line.len_chars())),
-                        file.rope.bytes().count(),
-                    )
-                };
+                let start_index = lsp_position_to_char(
+                    &file.rope,
+                    range.start.line as usize,
+                    range.start.character as usize,
+                );
+                let end_index = lsp_position_to_char(
+                    &file.rope,
+                    range.end.line as usize,
+                    range.end.character as usize,
+                );
+
+                let old_end_byte = file.rope.try_char_to_byte(end_index)?;
+                let old_end_position = Point::new(
+                    range.end.line as usize,
+                    range.end.character as usize,
+                );
+
                 // Update the document
-                let start_index = file.rope.line_to_char(range.start.line as usize)
-                    + range.start.character as usize;
-                let end_index =
-                    file.rope.line_to_char(range.end.line as usize) + range.end.character as usize;
                 file.rope.remove(start_index..end_index);
                 file.rope.insert(start_index, &change.text);
-                // Set new end positions
-                let (new_end_position, new_end_byte) = {
-                    let last_line_index = file.rope.len_lines() - 1;
-                    (
-                        file.rope
-                            .get_line(last_line_index)
-                            .context("getting last line for edit")
-                            .map(|last_line| Point::new(last_line_index, last_line.len_chars())),
-                        file.rope.bytes().count(),
-                    )
-                };
+
+                // Calculate new end position
+                let new_text_len_chars = change.text.chars().count();
+                let new_end_char_index = start_index + new_text_len_chars;
+                let new_end_byte = file.rope.try_char_to_byte(new_end_char_index)?;
+                let new_end_line = file.rope.char_to_line(new_end_char_index);
+                let new_end_line_start_char = file.rope.line_to_char(new_end_line);
+                let new_end_col_char = new_end_char_index - new_end_line_start_char;
+                let new_end_line_str = file
+                    .rope
+                    .get_line(new_end_line)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let new_end_col_utf16 = char_index_to_utf16_offset(&new_end_line_str, new_end_col_char);
+                let new_end_position = Point::new(new_end_line, new_end_col_utf16);
+
                 // Update the tree
                 if self.params.build_tree {
                     let mut old_tree = file.tree.take();
-                    let start_byte = file
-                        .rope
-                        .try_line_to_char(range.start.line as usize)
-                        .and_then(|start_char| {
-                            file.rope
-                                .try_char_to_byte(start_char + range.start.character as usize)
-                        })
-                        .map_err(anyhow::Error::msg);
+                    let start_byte = file.rope.try_char_to_byte(start_index)?;
                     if let Some(old_tree) = &mut old_tree {
-                        match (start_byte, old_end_position, new_end_position) {
-                            (Ok(start_byte), Ok(old_end_position), Ok(new_end_position)) => {
-                                old_tree.edit(&InputEdit {
-                                    start_byte,
-                                    old_end_byte,
-                                    new_end_byte,
-                                    start_position: Point::new(
-                                        range.start.line as usize,
-                                        range.start.character as usize,
-                                    ),
-                                    old_end_position,
-                                    new_end_position,
-                                });
-                                file.tree = match parse_tree(
-                                    &uri,
-                                    &file.rope.to_string(),
-                                    Some(old_tree),
-                                ) {
-                                    Ok(tree) => Some(tree),
-                                    Err(e) => {
-                                        error!("failed to edit tree: {e:?}");
-                                        None
-                                    }
-                                };
+                        old_tree.edit(&InputEdit {
+                            start_byte,
+                            old_end_byte,
+                            new_end_byte,
+                            start_position: Point::new(
+                                range.start.line as usize,
+                                range.start.character as usize,
+                            ),
+                            old_end_position,
+                            new_end_position,
+                        });
+                        file.tree = match parse_tree(
+                            &uri,
+                            &file.rope.to_string(),
+                            Some(old_tree),
+                        ) {
+                            Ok(tree) => Some(tree),
+                            Err(e) => {
+                                error!("failed to edit tree: {e:?}");
+                                None
                             }
-                            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                                error!("failed to build tree edit: {e:?}");
-                            }
-                        }
+                        };
                     }
                 }
             } else {
